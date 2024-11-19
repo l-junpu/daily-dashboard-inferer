@@ -1,6 +1,7 @@
-import asyncio
 import json
+import ollama
 import socket
+import asyncio
 
 class TcpInferer:
     def __init__(self, host, port, ollamaPort, terminator='<sobadd>'):
@@ -8,6 +9,7 @@ class TcpInferer:
         self.port = port
         self.ollamaPort = ollamaPort
         self.terminator = terminator
+        self.ollama = ollama.AsyncClient(host='http://localhost:11434')
         # details of our chromadb
         print(f'TcpInferer Initialized - {host}:{port}')
 
@@ -36,18 +38,22 @@ class TcpInferer:
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         # Wait for user prompt
-        messages = await self.await_user_prompt(reader)
+        convoBytes = await self.await_user_prompt(reader)
 
         # Compress prompt
-        compressed_prompt = self.compress_prompt(messages)
+        compressed_prompt = self.compress_prompt(convoBytes)
 
         # Convert byte array into Python Object (kinda json-like)
-        data = json.loads(messages)
+        convo = json.loads(convoBytes)
 
         # Disabling Nagle's algorithm for the socket
         writer.get_extra_info('socket').setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-        # Perform some ollama stuff
+        # Perform our query and write the response back to the golang server
+        async for part in await self.ollama.chat(model='qwen2:1.5b-instruct-q6_K', messages=convo, stream=True, keep_alive="15m"):
+            chunk = part['message']['content']
+            writer.write(chunk.encode('utf-8'))
+            await writer.drain()
 
         # Display Performance - Update parameter afterwards
         self.display_response_performance(0)
@@ -55,9 +61,6 @@ class TcpInferer:
         # Close the writer once we are done
         writer.close()
         await writer.wait_closed()
-
-        # Debug printing
-        print(messages)
 
 
     async def run(self):
