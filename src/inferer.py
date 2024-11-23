@@ -1,7 +1,10 @@
 import json
+from typing import List
 import ollama
 import socket
 import asyncio
+
+from src.chroma import ChromaDatabase
 
 class TcpInferer:
     def __init__(self, host, port, ollamaPort, terminator='<sobadd>'):
@@ -12,6 +15,8 @@ class TcpInferer:
         self.ollama = ollama.AsyncClient(host='http://localhost:11434')
         # details of our chromadb
         print(f'TcpInferer Initialized - {host}:{port}')
+
+        self.chroma = ChromaDatabase(host="localhost", port=8000, collectionName="vectordb")
 
 
     def display_response_performance(self, part):
@@ -34,33 +39,80 @@ class TcpInferer:
                 msg = buffer.decode()
                 msg = msg[:-len(self.terminator)]
                 return msg
+            
+    
+    async def update_user_question_for_rag(self, convo, tags: List[str]):
+        if len(tags) == 0: return convo
+
+        question_template = """Given the following conversation and a follow up question, rephrase the Follow Up Question to be a standalone question and do not add any additional text.
+        Chat History:
+        {}
+        Follow Up Question:
+        {}
+        Standalone Question:"""
+
+        chat_history = "\n".join(["{}: {}".format(m["role"], m["content"]) for m in convo[:-1]])
+        follow_up_question = "{}: {}".format(convo[-1]["role"], convo[-1]["content"])
+
+        # Generate summarized prompt
+        response = await self.ollama.generate(model="phi3:mini", 
+                                              prompt=question_template.format(chat_history, follow_up_question), 
+                                              stream=False, 
+                                              keep_alive="15m")
+        
+        
+        # Parse the summarized response from the llm
+        parts = response['response'].split(":\n\n")
+        summarized_prompt = parts[1] if len(parts) > 1 else response['response']
+        print("LLM Summarized Response: ", summarized_prompt)
+
+        # Find k-neighbours
+        neighbours = self.chroma.QueryPrompt(summarized_prompt, 5, tags)
+
+        # Update last question
+        summarized_template = """Given the following supporting information and a question, attempt to answer the question to the best of your abilities.
+        Supporting information:
+        {}
+        Question:
+        {}
+        Standalone Question:"""
+
+        original_qn = convo[-1]["content"]
+        supporting_info = "\n\n".join(neighbours["documents"][0])
+        convo[-1]["content"] = summarized_template.format(supporting_info, original_qn)
+
+        return convo
 
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         # Wait for user prompt
         convoBytes = await self.await_user_prompt(reader)
-
-        # Compress prompt
-        compressed_prompt = self.compress_prompt(convoBytes)
+        print("Received response")
 
         # Convert byte array into Python Object (kinda json-like)
         convo = json.loads(convoBytes)
 
+        # If conversation tags exist, retrieve supporting information from ChromaDB
+        convo = await self.update_user_question_for_rag(convo, ["pepe"])
+
         # Disabling Nagle's algorithm for the socket
         writer.get_extra_info('socket').setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-        # Perform our query and write the response back to the golang server
-        async for part in await self.ollama.chat(model='qwen2:1.5b-instruct-q6_K', messages=convo, stream=True, keep_alive="15m"):
+        # Perform our query and write the response back to the golang server - phi3:mini / qwen2:1.5b-instruct-q6_K
+        async for part in await self.ollama.chat(model='phi3:mini', messages=convo, stream=True, keep_alive="15m"):
             chunk = part['message']['content']
             writer.write(chunk.encode('utf-8'))
             await writer.drain()
 
         # Display Performance - Update parameter afterwards
-        self.display_response_performance(0)
+        self.display_response_performance(part)
 
         # Close the writer once we are done
+        await writer.drain()
+        print("Done draining")
         writer.close()
         await writer.wait_closed()
+        print("Done closing")
 
 
     async def run(self):
